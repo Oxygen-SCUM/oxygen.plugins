@@ -106,66 +106,74 @@ public class RconServer
     }
 
     private async Task HandleClientAsync(TcpClient client)
+{
+    using NetworkStream stream = client.GetStream();
+    bool isAuthenticated = false;
+
+    try
     {
-        using NetworkStream stream = client.GetStream();
-        bool isAuthenticated = false;
-
-        try
+        while (client.Connected && _isRunning)
         {
-            while (client.Connected && _isRunning)
+            byte[] sizeBuffer = new byte[4];
+            int bytesRead = await stream.ReadAsync(sizeBuffer, 0, 4);
+            if (bytesRead < 4) break;
+
+            int packetSize = BitConverter.ToInt32(sizeBuffer, 0);
+            if (packetSize < 10 || packetSize > 4096) break;
+
+            byte[] packetBuffer = new byte[packetSize];
+            int read = 0;
+            
+            while (read < packetSize)
             {
-                byte[] sizeBuffer = new byte[4];
-                int bytesRead = await stream.ReadAsync(sizeBuffer, 0, 4);
-                if (bytesRead < 4) break;
+                int currentRead = await stream.ReadAsync(packetBuffer, read, packetSize - read);
+                if (currentRead == 0) break;
+                read += currentRead;
+            }
+            if (read < packetSize) break; 
 
-                int packetSize = BitConverter.ToInt32(sizeBuffer, 0);
-                if (packetSize < 10 || packetSize > 4096) break;
+            using MemoryStream ms = new MemoryStream(packetBuffer);
+            using BinaryReader reader = new BinaryReader(ms, Encoding.UTF8);
 
-                byte[] packetBuffer = new byte[packetSize];
-                int read = 0;
-                while (read < packetSize)
+            int requestId = reader.ReadInt32();
+            int requestType = reader.ReadInt32();
+            string body = ReadNullTerminatedString(reader);
+
+            if (requestType == SERVERDATA_AUTH)
+            {
+                if (body == _password)
                 {
-                    read += await stream.ReadAsync(packetBuffer, read, packetSize - read);
+                    isAuthenticated = true;
+                    await SendPacketAsync(stream, requestId, SERVERDATA_AUTH_RESPONSE, "");
                 }
-
-                using MemoryStream ms = new MemoryStream(packetBuffer);
-                using BinaryReader reader = new BinaryReader(ms, Encoding.UTF8);
-
-                int requestId = reader.ReadInt32();
-                int requestType = reader.ReadInt32();
-                string body = ReadNullTerminatedString(reader);
-
-                if (requestType == SERVERDATA_AUTH)
+                else
                 {
-                    if (body == _password)
-                    {
-                        isAuthenticated = true;
-                        await SendPacketAsync(stream, requestId, SERVERDATA_AUTH_RESPONSE, "");
-                    }
-                    else
-                    {
-                        await SendPacketAsync(stream, -1, SERVERDATA_AUTH_RESPONSE, "");
-                        break;
-                    }
-                }
-                else if (requestType == SERVERDATA_EXECCOMMAND)
-                {
-                    if (!isAuthenticated) break;
-
-                    string responseMessage = "Receive command but not exec.\n";
-                    if (OnCommandReceived != null)
-                    {
-                        try { responseMessage = await OnCommandReceived.Invoke(body); }
-                        catch (Exception ex) { responseMessage = $"Fail: {ex.Message}\n"; }
-                    }
-
-                    await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, responseMessage);
+                    await SendPacketAsync(stream, -1, SERVERDATA_AUTH_RESPONSE, "");
+                    break;
                 }
             }
+            else if (requestType == SERVERDATA_EXECCOMMAND)
+            {
+                if (!isAuthenticated) break;
+
+                string responseMessage = "Receive command but not exec.\n";
+                if (OnCommandReceived != null)
+                {
+                    try { responseMessage = await OnCommandReceived.Invoke(body); }
+                    catch (Exception ex) { responseMessage = $"Fail: {ex.Message}\n"; }
+                }
+
+                await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, responseMessage);
+            }
+            else if (requestType == SERVERDATA_RESPONSE_VALUE)
+            {
+                await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, body);
+            }
         }
-        catch { }
-        finally { client.Close(); }
     }
+    catch { }
+    finally { client.Close(); }
+}
 
     private async Task SendPacketAsync(NetworkStream stream, int id, int type, string body)
     {
