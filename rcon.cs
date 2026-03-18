@@ -11,21 +11,22 @@ using Oxygen.Csharp.Core;
 [Info("Custom RCON", "jEMIXS", "1.0.0")]
 public class CustomRconPlugin : OxygenPlugin
 {
+    string rconPassword = "SuperAdmin123"; // rcon password
+    int rconPort = 28015; // rcon port
+
     private RconServer _rcon;
 
     public override void OnLoad()
     {
-        Console.WriteLine("[RCON Plugin] init...");
-
         try
         {
-            _rcon = new RconServer(28015, "SuperAdmin123"); // rcon port and password
+            _rcon = new RconServer(rconPort, rconPassword);
 
             _rcon.OnCommandReceived += HandleRconCommand;
 
             _rcon.Start();
             
-            Console.WriteLine("[RCON Plugin] started 28015!");
+            Console.WriteLine($"[RCON Plugin] started {rconPort}!");
         }
         catch (Exception ex)
         {
@@ -47,9 +48,7 @@ public class CustomRconPlugin : OxygenPlugin
 
     private async Task<string> HandleRconCommand(string command)
     {
-        Console.WriteLine($"[RCON] received command: {command}");
         var result = await Server.ProcessCommandAsync(command);
-
         return result.Message;
     }
 }
@@ -106,74 +105,139 @@ public class RconServer
     }
 
     private async Task HandleClientAsync(TcpClient client)
-{
-    using NetworkStream stream = client.GetStream();
-    bool isAuthenticated = false;
-
-    try
     {
-        while (client.Connected && _isRunning)
+        using NetworkStream stream = client.GetStream();
+        bool isAuthenticated = false;
+
+        try
         {
-            byte[] sizeBuffer = new byte[4];
-            int bytesRead = await stream.ReadAsync(sizeBuffer, 0, 4);
-            if (bytesRead < 4) break;
-
-            int packetSize = BitConverter.ToInt32(sizeBuffer, 0);
-            if (packetSize < 10 || packetSize > 4096) break;
-
-            byte[] packetBuffer = new byte[packetSize];
-            int read = 0;
-            
-            while (read < packetSize)
+            while (client.Connected && _isRunning)
             {
-                int currentRead = await stream.ReadAsync(packetBuffer, read, packetSize - read);
-                if (currentRead == 0) break;
-                read += currentRead;
-            }
-            if (read < packetSize) break; 
-
-            using MemoryStream ms = new MemoryStream(packetBuffer);
-            using BinaryReader reader = new BinaryReader(ms, Encoding.UTF8);
-
-            int requestId = reader.ReadInt32();
-            int requestType = reader.ReadInt32();
-            string body = ReadNullTerminatedString(reader);
-
-            if (requestType == SERVERDATA_AUTH)
-            {
-                if (body == _password)
+                byte[] sizeBuffer = new byte[4];
+                
+                int sizeBytesRead = 0;
+                while (sizeBytesRead < 4)
                 {
-                    isAuthenticated = true;
-                    await SendPacketAsync(stream, requestId, SERVERDATA_AUTH_RESPONSE, "");
+                    int read = await stream.ReadAsync(sizeBuffer, sizeBytesRead, 4 - sizeBytesRead);
+                    if (read == 0) break;
+                    sizeBytesRead += read;
                 }
-                else
-                {
-                    await SendPacketAsync(stream, -1, SERVERDATA_AUTH_RESPONSE, "");
-                    break;
-                }
-            }
-            else if (requestType == SERVERDATA_EXECCOMMAND)
-            {
-                if (!isAuthenticated) break;
+                if (sizeBytesRead < 4) break;
 
-                string responseMessage = "Receive command but not exec.\n";
-                if (OnCommandReceived != null)
-                {
-                    try { responseMessage = await OnCommandReceived.Invoke(body); }
-                    catch (Exception ex) { responseMessage = $"Fail: {ex.Message}\n"; }
-                }
+                int packetSize = BitConverter.ToInt32(sizeBuffer, 0);
+                if (packetSize < 10 || packetSize > 4096) break;
 
-                await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, responseMessage);
-            }
-            else if (requestType == SERVERDATA_RESPONSE_VALUE)
-            {
-                await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, body);
+                byte[] packetBuffer = new byte[packetSize];
+                int readBytes = 0;
+                
+                while (readBytes < packetSize)
+                {
+                    int currentRead = await stream.ReadAsync(packetBuffer, readBytes, packetSize - readBytes);
+                    if (currentRead == 0) break;
+                    readBytes += currentRead;
+                }
+                if (readBytes < packetSize) break; 
+
+                using MemoryStream ms = new MemoryStream(packetBuffer);
+                using BinaryReader reader = new BinaryReader(ms, Encoding.UTF8);
+
+                int requestId = reader.ReadInt32();
+                int requestType = reader.ReadInt32();
+                string body = ReadNullTerminatedString(reader);
+
+                if (requestType == SERVERDATA_AUTH)
+                {
+                    if (body == _password)
+                    {
+                        isAuthenticated = true;
+                        
+                        await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, "");
+                        
+                        await SendPacketAsync(stream, requestId, SERVERDATA_AUTH_RESPONSE, "");
+                    }
+                    else
+                    {
+                        await SendPacketAsync(stream, -1, SERVERDATA_AUTH_RESPONSE, "");
+                        break;
+                    }
+                }
+                else if (requestType == SERVERDATA_EXECCOMMAND)
+                {
+                    if (!isAuthenticated) break;
+
+                    string responseMessage = "Receive command but not exec.\n";
+                    if (OnCommandReceived != null)
+                    {
+                        try { responseMessage = await OnCommandReceived.Invoke(body); }
+                        catch (Exception ex) { responseMessage = $"Fail: {ex.Message}\n"; }
+                    }
+
+                    await SendSmartChunkedResponseAsync(stream, requestId, responseMessage);
+                }
+                else if (requestType == SERVERDATA_RESPONSE_VALUE)
+                {
+                    await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, body);
+                }
             }
         }
+        catch { }
+        finally { client.Close(); }
     }
-    catch { }
-    finally { client.Close(); }
-}
+
+    private async Task SendSmartChunkedResponseAsync(NetworkStream stream, int requestId, string body)
+    {
+        if (string.IsNullOrEmpty(body))
+        {
+            await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, "");
+            return;
+        }
+
+        const int maxCharsPerPacket = 3900; 
+        
+        string[] lines = body.Split(new[] { '\n' }, StringSplitOptions.None);
+        StringBuilder currentChunk = new StringBuilder();
+
+        foreach (string line in lines)
+        {
+            if (line.Length > maxCharsPerPacket)
+            {
+                if (currentChunk.Length > 0)
+                {
+                    await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, currentChunk.ToString());
+                    currentChunk.Clear();
+                }
+
+                for (int i = 0; i < line.Length; i += maxCharsPerPacket)
+                {
+                    int len = Math.Min(maxCharsPerPacket, line.Length - i);
+                    string part = line.Substring(i, len);
+                    
+                    if (i + maxCharsPerPacket >= line.Length) part += "\n";
+                        
+                    await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, part);
+                }
+            }
+            else
+            {
+                if (currentChunk.Length + line.Length + 1 > maxCharsPerPacket)
+                {
+                    await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, currentChunk.ToString());
+                    currentChunk.Clear();
+                }
+                currentChunk.Append(line).Append('\n');
+            }
+        }
+
+        if (currentChunk.Length > 0)
+        {
+            if (currentChunk.Length > 0 && currentChunk[currentChunk.Length - 1] == '\n')
+            {
+                currentChunk.Length--;
+            }
+                
+            await SendPacketAsync(stream, requestId, SERVERDATA_RESPONSE_VALUE, currentChunk.ToString());
+        }
+    }
 
     private async Task SendPacketAsync(NetworkStream stream, int id, int type, string body)
     {
